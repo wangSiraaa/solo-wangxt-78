@@ -78,8 +78,8 @@ go run ./cmd/server
 
 # 3. 注册端点（testkit 是内置的本地测试接收器，返回签名密钥）
 curl -s localhost:8080/v1/endpoints -d '{
-  "url": "http://127.0.0.1:8080/testkit/receive?secret=whsec_dev&key=demo",
-  "secret": "whsec_dev",
+  "url": "http://127.0.0.1:8080/testkit/receive?secret=TEST_ONLY_WEBHOOK_DEMO_SECRET&key=demo",
+  "secret": "TEST_ONLY_WEBHOOK_DEMO_SECRET",
   "subscribed_events": ["order.created"],
   "retry_policy": {"max_attempts": 5, "backoff_base_ms": 500}
 }' | jq .
@@ -119,7 +119,7 @@ curl -s -XPOST localhost:8080/v1/deliveries/<delivery-id>/replay | jq .
 ### 独立客户接收器示例
 
 ```bash
-WEBHOOK_SECRET=whsec_dev PORT=9090 go run ./cmd/receiver
+WEBHOOK_SECRET=TEST_ONLY_WEBHOOK_DEMO_SECRET PORT=9090 go run ./cmd/receiver
 # POST /webhook 验签+时间窗+事件 id 去重；GET /state 查看计数器
 ```
 

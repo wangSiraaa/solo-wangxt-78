@@ -328,7 +328,7 @@ components:
         - $ref: '#/components/schemas/Endpoint'
         - type: object
           properties:
-            secret: { type: string, example: whsec_9f2c... }
+            secret: { type: string, example: TEST_ONLY_WEBHOOK_EXAMPLE_SECRET }
     Event:
       type: object
       properties:

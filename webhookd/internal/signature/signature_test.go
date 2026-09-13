@@ -51,7 +51,7 @@ func TestVectors(t *testing.T) {
 }
 
 func TestVerifyRejects(t *testing.T) {
-	secret := "whsec_testsecret"
+	secret := "TEST_ONLY_WEBHOOK_VERIFY_SECRET"
 	body := []byte(`{"id":"evt_1"}`)
 	ts := time.Now().Unix()
 	header := SignHeader(secret, ts, body)
@@ -59,7 +59,7 @@ func TestVerifyRejects(t *testing.T) {
 	if err := Verify(secret, header, body, time.Now(), DefaultTolerance); err != nil {
 		t.Fatalf("valid signature rejected: %v", err)
 	}
-	if err := Verify("whsec_wrong", header, body, time.Now(), DefaultTolerance); !errors.Is(err, ErrSignatureMismatch) {
+	if err := Verify("TEST_ONLY_WRONG_WEBHOOK_SECRET", header, body, time.Now(), DefaultTolerance); !errors.Is(err, ErrSignatureMismatch) {
 		t.Errorf("wrong secret: got %v, want ErrSignatureMismatch", err)
 	}
 	if err := Verify(secret, header, []byte(`{"id":"evt_2"}`), time.Now(), DefaultTolerance); !errors.Is(err, ErrSignatureMismatch) {

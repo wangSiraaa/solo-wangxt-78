@@ -1,4 +1,5 @@
 // Command genvectors regenerates internal/signature/testdata/vectors.json.
+// Public test inputs only; never use these values for real webhook endpoints.
 // The vectors are fixed constants so any implementation (Go or otherwise)
 // can verify interoperability of the signing scheme.
 //
@@ -31,19 +32,19 @@ func main() {
 	}{
 		{
 			name:   "basic-order-event",
-			secret: "whsec_0000000000000000000000000000000000000000000000000000000000000001",
+			secret: "TEST_ONLY_WEBHOOK_VECTOR_BASIC",
 			ts:     1694515200,
 			body:   `{"id":"evt_0190a8b0-7a2b-7c3d-8e4f-000000000001","type":"order.created","created_at":"2023-09-12T10:00:00Z","data":{"business_key":"order-42","amount":100}}`,
 		},
 		{
 			name:   "empty-json-object",
-			secret: "whsec_abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+			secret: "TEST_ONLY_WEBHOOK_VECTOR_EMPTY",
 			ts:     1700000000,
 			body:   `{}`,
 		},
 		{
 			name:   "unicode-payload",
-			secret: "whsec_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+			secret: "TEST_ONLY_WEBHOOK_VECTOR_UNICODE",
 			ts:     1757664000,
 			body:   `{"id":"evt_unicode","type":"user.updated","data":{"name":"张三","emoji":"🚀"}}`,
 		},

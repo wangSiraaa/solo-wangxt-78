@@ -25,7 +25,7 @@ import (
 	"github.com/example/webhookd/internal/testkit"
 )
 
-const testSecret = "whsec_1111111111111111111111111111111111111111111111111111111111111111"
+const testSecret = "TEST_ONLY_WEBHOOK_INTEGRATION_SECRET"
 
 type env struct {
 	t      *testing.T

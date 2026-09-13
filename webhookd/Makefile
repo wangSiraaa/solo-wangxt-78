@@ -22,7 +22,7 @@ run:
 	$(GO) run ./cmd/server
 
 receiver:
-	WEBHOOK_SECRET?=whsec_devsecret PORT?=9090 $(GO) run ./cmd/receiver
+	WEBHOOK_SECRET?=TEST_ONLY_WEBHOOK_DEMO_SECRET PORT?=9090 $(GO) run ./cmd/receiver
 
 vectors:
 	$(GO) run ./scripts/genvectors > internal/signature/testdata/vectors.json
