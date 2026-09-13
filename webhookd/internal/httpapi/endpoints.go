@@ -32,6 +32,8 @@ type createEndpointReq struct {
 func endpointJSON(e *store.Endpoint, includeSecret bool) gin.H {
 	out := gin.H{
 		"id":                e.ID,
+		"lineage_id":        e.LineageID,
+		"generation":        e.Generation,
 		"url":               e.URL,
 		"description":       e.Description,
 		"subscribed_events": e.SubscribedEvents,
@@ -44,6 +46,9 @@ func endpointJSON(e *store.Endpoint, includeSecret bool) gin.H {
 		},
 		"created_at": e.CreatedAt,
 		"updated_at": e.UpdatedAt,
+	}
+	if e.PreviousSecretExpiresAt != nil {
+		out["previous_secret_expires_at"] = e.PreviousSecretExpiresAt
 	}
 	if includeSecret {
 		out["secret"] = e.Secret
@@ -132,27 +137,21 @@ func (s *Server) getEndpoint(c *gin.Context) {
 }
 
 type updateEndpointReq struct {
-	URL              *string         `json:"url"`
 	Description      *string         `json:"description"`
 	SubscribedEvents *[]string       `json:"subscribed_events"`
 	Status           *string         `json:"status" binding:"omitempty,oneof=active disabled"`
 	RetryPolicy      *retryPolicyReq `json:"retry_policy"`
 }
 
+// updateEndpoint patches mutable fields. The URL is deliberately NOT
+// patchable: changing the receiver domain is a migration (new generation).
 func (s *Server) updateEndpoint(c *gin.Context) {
 	var req updateEndpointReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		abort(c, http.StatusBadRequest, err)
 		return
 	}
-	if req.URL != nil {
-		if err := s.guard.ValidateURL(*req.URL); err != nil {
-			abort(c, http.StatusBadRequest, errors.New("url_not_allowed: "+err.Error()))
-			return
-		}
-	}
 	patch := store.EndpointPatch{
-		URL:              req.URL,
 		Description:      req.Description,
 		SubscribedEvents: req.SubscribedEvents,
 		Status:           req.Status,
@@ -175,6 +174,36 @@ func (s *Server) updateEndpoint(c *gin.Context) {
 	c.JSON(http.StatusOK, endpointJSON(ep, false))
 }
 
+type migrateEndpointReq struct {
+	URL string `json:"url" binding:"required"`
+}
+
+// migrateEndpoint switches the lineage to a new receiver domain: the old
+// generation is superseded and unsent deliveries move to the new generation,
+// all in one transaction. In-flight attempts complete against their own
+// (old-generation) delivery rows.
+func (s *Server) migrateEndpoint(c *gin.Context) {
+	var req migrateEndpointReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		abort(c, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.guard.ValidateURL(req.URL); err != nil {
+		abort(c, http.StatusBadRequest, errors.New("url_not_allowed: "+err.Error()))
+		return
+	}
+	ep, err := s.store.MigrateEndpoint(c.Request.Context(), c.Param("id"), req.URL)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		abort(c, status, err)
+		return
+	}
+	c.JSON(http.StatusCreated, endpointJSON(ep, false))
+}
+
 func (s *Server) deleteEndpoint(c *gin.Context) {
 	if err := s.store.DisableEndpoint(c.Request.Context(), c.Param("id")); err != nil {
 		status := http.StatusInternalServerError
@@ -187,13 +216,31 @@ func (s *Server) deleteEndpoint(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "disabled"})
 }
 
+type rotateSecretReq struct {
+	// WindowSeconds bounds how long the PREVIOUS secret stays acceptable
+	// after rotation. Default 1h, max 24h — old signatures are never kept
+	// valid indefinitely.
+	WindowSeconds *int `json:"window_seconds" binding:"omitempty,min=0,max=86400"`
+}
+
 func (s *Server) rotateSecret(c *gin.Context) {
+	var req rotateSecretReq
+	if c.Request.Body != nil && c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			abort(c, http.StatusBadRequest, err)
+			return
+		}
+	}
+	window := 3600
+	if req.WindowSeconds != nil {
+		window = *req.WindowSeconds
+	}
 	secret, err := signature.GenerateSecret()
 	if err != nil {
 		abort(c, http.StatusInternalServerError, err)
 		return
 	}
-	ep, err := s.store.RotateSecret(c.Request.Context(), c.Param("id"), secret)
+	ep, err := s.store.RotateSecret(c.Request.Context(), c.Param("id"), secret, window)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, store.ErrNotFound) {

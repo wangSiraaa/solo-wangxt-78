@@ -34,11 +34,11 @@ type env struct {
 	cancel context.CancelFunc
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T, port int) *env {
 	t.Helper()
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			Port(15433).
+			Port(uint32(port)).
 			Database("webhookd_test").
 			Logger(io.Discard),
 	)
@@ -48,7 +48,7 @@ func setup(t *testing.T) *env {
 	t.Cleanup(func() { pg.Stop() }) //nolint:errcheck
 
 	ctx := context.Background()
-	st, err := store.New(ctx, "postgres://postgres:postgres@localhost:15433/webhookd_test?sslmode=disable")
+	st, err := store.New(ctx, fmt.Sprintf("postgres://postgres:postgres@localhost:%d/webhookd_test?sslmode=disable", port))
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
@@ -185,7 +185,7 @@ func (e *env) setMode(key, mode string) {
 // --- tests ---
 
 func TestEndToEnd(t *testing.T) {
-	e := setup(t)
+	e := setup(t, 15433)
 
 	t.Run("HappyPath", func(t *testing.T) {
 		e.createEndpoint("happy", "ok", "t.happy", 5, 2000)

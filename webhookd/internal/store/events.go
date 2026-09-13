@@ -13,6 +13,7 @@ type CreateEventParams struct {
 	ID             string
 	IdempotencyKey string
 	EventType      string
+	BusinessKey    string
 	Payload        json.RawMessage
 }
 
@@ -25,30 +26,60 @@ type CreateEventResult struct {
 	Duplicate bool
 }
 
-// CreateEvent is the transactional outbox: in ONE transaction it inserts the
-// event, matches active subscriptions and writes the pending delivery rows.
-// Re-publishing with the same idempotency key returns the stored event
-// (event identity is stable) without creating new deliveries.
+const eventCols = `id, idempotency_key, event_type, business_key, key_seq, payload, created_at`
+
+// CreateEvent is the transactional outbox: in ONE transaction it assigns the
+// per-business-key sequence number, inserts the event, matches active
+// subscriptions and writes the pending delivery rows. Re-publishing with the
+// same idempotency key returns the stored event (event identity and sequence
+// are stable) without creating new deliveries.
 func (s *Store) CreateEvent(ctx context.Context, p CreateEventParams) (*CreateEventResult, error) {
 	res := &CreateEventResult{}
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		// Fast path: idempotent replay returns the original fact without
+		// burning a sequence number (gaps should mean skips, not replays).
 		err := tx.QueryRow(ctx,
-			`INSERT INTO events (id, idempotency_key, event_type, payload)
-			 VALUES ($1,$2,$3,$4)
-			 ON CONFLICT (idempotency_key) DO NOTHING
-			 RETURNING id, idempotency_key, event_type, payload, created_at`,
-			p.ID, p.IdempotencyKey, p.EventType, p.Payload).
+			`SELECT `+eventCols+` FROM events WHERE idempotency_key = $1`, p.IdempotencyKey).
 			Scan(&res.Event.ID, &res.Event.IdempotencyKey, &res.Event.EventType,
-				&res.Event.Payload, &res.Event.CreatedAt)
+				&res.Event.BusinessKey, &res.Event.KeySeq, &res.Event.Payload, &res.Event.CreatedAt)
+		if err == nil {
+			res.Duplicate = true
+			dels, err := deliveriesForEvent(ctx, tx, res.Event.ID)
+			if err != nil {
+				return err
+			}
+			res.Deliveries = dels
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		// Per-key monotonic sequence, assigned inside the transaction.
+		var seq int64
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO key_sequences (business_key, next_seq) VALUES ($1, 1)
+			 ON CONFLICT (business_key) DO UPDATE SET next_seq = key_sequences.next_seq + 1
+			 RETURNING next_seq`, p.BusinessKey).Scan(&seq); err != nil {
+			return err
+		}
+
+		err = tx.QueryRow(ctx,
+			`INSERT INTO events (id, idempotency_key, event_type, business_key, key_seq, payload)
+			 VALUES ($1,$2,$3,$4,$5,$6)
+			 ON CONFLICT (idempotency_key) DO NOTHING
+			 RETURNING `+eventCols,
+			p.ID, p.IdempotencyKey, p.EventType, p.BusinessKey, seq, p.Payload).
+			Scan(&res.Event.ID, &res.Event.IdempotencyKey, &res.Event.EventType,
+				&res.Event.BusinessKey, &res.Event.KeySeq, &res.Event.Payload, &res.Event.CreatedAt)
 
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Idempotent replay: return the original fact, no new deliveries.
+			// Lost a concurrent-publish race: return the winner's event.
 			res.Duplicate = true
 			if err := tx.QueryRow(ctx,
-				`SELECT id, idempotency_key, event_type, payload, created_at
-				 FROM events WHERE idempotency_key = $1`, p.IdempotencyKey).
+				`SELECT `+eventCols+` FROM events WHERE idempotency_key = $1`, p.IdempotencyKey).
 				Scan(&res.Event.ID, &res.Event.IdempotencyKey, &res.Event.EventType,
-					&res.Event.Payload, &res.Event.CreatedAt); err != nil {
+					&res.Event.BusinessKey, &res.Event.KeySeq, &res.Event.Payload, &res.Event.CreatedAt); err != nil {
 				return err
 			}
 			dels, err := deliveriesForEvent(ctx, tx, res.Event.ID)
@@ -64,32 +95,34 @@ func (s *Store) CreateEvent(ctx context.Context, p CreateEventParams) (*CreateEv
 
 		// Subscription matching: exact event type or '*' wildcard.
 		rows, err := tx.Query(ctx,
-			`SELECT id FROM endpoints
+			`SELECT id, lineage_id FROM endpoints
 			 WHERE status = 'active'
 			   AND (subscribed_events && $1::text[] OR subscribed_events @> ARRAY['*']::text[])`,
 			[]string{p.EventType})
 		if err != nil {
 			return err
 		}
-		var endpointIDs []string
+		type epRef struct{ id, lineage string }
+		var eps []epRef
 		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
+			var r epRef
+			if err := rows.Scan(&r.id, &r.lineage); err != nil {
 				rows.Close()
 				return err
 			}
-			endpointIDs = append(endpointIDs, id)
+			eps = append(eps, r)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
 
-		for _, epID := range endpointIDs {
+		for _, ep := range eps {
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO deliveries (event_id, endpoint_id) VALUES ($1,$2)
+				`INSERT INTO deliveries (event_id, endpoint_id, business_key, key_seq, lineage_id)
+				 VALUES ($1,$2,$3,$4,$5)
 				 ON CONFLICT (event_id, endpoint_id) DO NOTHING`,
-				res.Event.ID, epID); err != nil {
+				res.Event.ID, ep.id, res.Event.BusinessKey, res.Event.KeySeq, ep.lineage); err != nil {
 				return err
 			}
 		}
@@ -109,8 +142,8 @@ func (s *Store) CreateEvent(ctx context.Context, p CreateEventParams) (*CreateEv
 func (s *Store) GetEvent(ctx context.Context, id string) (*Event, error) {
 	var e Event
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, idempotency_key, event_type, payload, created_at FROM events WHERE id = $1`, id).
-		Scan(&e.ID, &e.IdempotencyKey, &e.EventType, &e.Payload, &e.CreatedAt)
+		`SELECT `+eventCols+` FROM events WHERE id = $1`, id).
+		Scan(&e.ID, &e.IdempotencyKey, &e.EventType, &e.BusinessKey, &e.KeySeq, &e.Payload, &e.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

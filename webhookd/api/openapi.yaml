@@ -10,12 +10,37 @@ info:
     ## Delivery semantics
     * At-least-once delivery; the **event id never changes** across retries
       and dead-letter replays, so receivers can deduplicate on `Webhook-Id`.
+      (Network delivery cannot guarantee end-to-end exactly-once; combine
+      at-least-once delivery with receiver-side idempotency instead.)
     * 2xx = success. 429 = retry (honors `Retry-After`). 5xx and transport
       errors (timeout, reset — i.e. possibly lost responses) = retry with
       exponential backoff. Other 4xx and 3xx (redirects are never followed)
       = dead-letter.
     * Dead deliveries can be replayed; replay re-sends the **original event**
       and never manufactures a new business fact.
+
+    ## Per-business-key sequences
+    Events carry a `business_key` and a per-key sequence number `seq`.
+    Events of the same key are delivered strictly in `seq` order (head-of-
+    line); different keys are delivered in parallel. A poison message blocks
+    only its own key; a human may `skip` it (reason required), after which
+    the key continues — the skipped `seq` remains a **visible gap**
+    downstream.
+
+    ## Endpoint generations
+    Changing the receiver domain is a **migration** (`POST
+    /v1/endpoints/{id}/migrate`), never an in-place edit: the old generation
+    is superseded and a new generation row takes over. Already-succeeded
+    deliveries stay untouched; in-flight attempts complete against their own
+    old-generation rows (a late receipt from the old domain can never
+    confirm a new-generation task); unsent deliveries are re-pointed to the
+    new generation in the same transaction.
+
+    ## Secret rotation
+    `POST /v1/endpoints/{id}/rotate-secret` installs a new secret and keeps
+    the previous one acceptable only for a bounded window
+    (`window_seconds`, default 1h, max 24h). Receivers should accept both
+    secrets during the window and reject the old one afterwards.
 
     ## Webhook request sent to endpoints
     ```
@@ -25,10 +50,12 @@ info:
     Webhook-Timestamp: <unix seconds>
     Webhook-Signature: t=<unix>,v1=<hex-hmac>      # HMAC-SHA256(secret, "<t>.<body>")
 
-    {"id": "...", "type": "order.created", "created_at": "...", "data": {...}}
+    {"id": "...", "type": "order.created", "created_at": "...",
+     "business_key": "order-42", "seq": 7, "data": {...}}
     ```
     Receivers should verify the signature, reject timestamps outside a ±5
-    minute window, and deduplicate on the event id.
+    minute window, deduplicate on the event id, and track `seq` per
+    `business_key` to detect gaps.
 
     ## SSRF protections
     Endpoint URLs are validated at registration (http/https only, no
@@ -114,7 +141,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [endpoints]
-      summary: Update URL (re-validated), subscriptions, status or retry policy
+      summary: Update subscriptions, status or retry policy (URL changes use /migrate)
       parameters: [{ $ref: '#/components/parameters/Id' }]
       requestBody:
         content:
@@ -122,7 +149,6 @@ paths:
             schema:
               type: object
               properties:
-                url: { type: string }
                 description: { type: string }
                 subscribed_events: { type: array, items: { type: string } }
                 status: { type: string, enum: [active, disabled] }
@@ -143,11 +169,54 @@ paths:
         '200': { description: Disabled }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/endpoints/{id}/migrate:
+    post:
+      tags: [endpoints]
+      summary: Migrate the lineage to a new receiver domain (new generation)
+      description: |
+        One transaction: old generation superseded, new generation created
+        (subscriptions/secret/retry policy copied), unsent deliveries
+        re-pointed. Succeeded deliveries are untouched; in-flight attempts
+        complete against their own old-generation rows.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, example: https://new-domain.example.com/webhooks }
+      responses:
+        '201':
+          description: New generation created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Endpoint' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/endpoints/{id}/rotate-secret:
     post:
       tags: [endpoints]
-      summary: Rotate the signing secret (new secret returned once)
+      summary: Rotate the signing secret (bounded dual-secret window)
+      description: |
+        Installs a new current secret (returned once) and keeps the previous
+        secret acceptable only until `window_seconds` from now. The old
+        secret is never kept valid indefinitely.
       parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                window_seconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 86400
+                  default: 3600
       responses:
         '200':
           description: OK
@@ -180,6 +249,13 @@ paths:
               required: [type, data]
               properties:
                 type: { type: string, example: order.created }
+                business_key:
+                  type: string
+                  example: order-42
+                  description: |
+                    Ordering scope; events with the same key are delivered in
+                    sequence. Falls back to `data.business_key`, then to the
+                    event id.
                 data:
                   type: object
                   example: { business_key: order-42, amount: 100 }
@@ -214,7 +290,8 @@ paths:
       parameters:
         - { name: event_id, in: query, schema: { type: string } }
         - { name: endpoint_id, in: query, schema: { type: string } }
-        - { name: status, in: query, schema: { type: string, enum: [pending, delivering, succeeded, dead] } }
+        - { name: business_key, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, delivering, succeeded, dead, skipped] } }
         - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
       responses:
         '200':
@@ -253,7 +330,9 @@ paths:
       summary: Replay a dead-letter delivery
       description: |
         Re-queues a **dead** delivery. The original event row is reused
-        as-is — replay never creates a new event / business fact.
+        as-is — replay never creates a new event / business fact. If the
+        delivery's generation was superseded, the replay goes to the active
+        generation.
       parameters: [{ $ref: '#/components/parameters/Id' }]
       responses:
         '200':
@@ -265,6 +344,43 @@ paths:
                 properties:
                   delivery: { $ref: '#/components/schemas/Delivery' }
                   note: { type: string }
+        '409':
+          description: Delivery is not in dead state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/deliveries/{id}/skip:
+    post:
+      tags: [deliveries]
+      summary: Human decision to skip a poison message
+      description: |
+        Marks a **dead** delivery as skipped. The reason is mandatory and
+        recorded with the actor. Skipping unblocks the rest of its business
+        key; the skipped `seq` remains a visible gap downstream — the event
+        is never delivered.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, example: "poison payload confirmed with customer; discarding" }
+                resolved_by: { type: string, example: "ops@example.com" }
+      responses:
+        '200':
+          description: Skipped
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivery: { $ref: '#/components/schemas/Delivery' }
+                  note: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '409':
           description: Delivery is not in dead state
           content:
@@ -316,10 +432,19 @@ components:
       type: object
       properties:
         id: { type: string, format: uuid }
+        lineage_id:
+          type: string
+          format: uuid
+          description: Shared by all generations of one logical endpoint.
+        generation: { type: integer, example: 2 }
         url: { type: string }
         description: { type: string }
         subscribed_events: { type: array, items: { type: string } }
-        status: { type: string, enum: [active, disabled] }
+        status: { type: string, enum: [active, disabled, superseded] }
+        previous_secret_expires_at:
+          type: string
+          format: date-time
+          description: End of the bounded dual-secret acceptance window.
         retry_policy: { $ref: '#/components/schemas/RetryPolicy' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -334,6 +459,10 @@ components:
       properties:
         id: { type: string, format: uuid }
         type: { type: string }
+        business_key: { type: string, example: order-42 }
+        seq:
+          type: integer
+          description: Position in the per-business-key delivery sequence.
         data: { type: object }
         created_at: { type: string, format: date-time }
     Delivery:
@@ -341,12 +470,21 @@ components:
       properties:
         id: { type: string, format: uuid }
         event_id: { type: string, format: uuid }
-        endpoint_id: { type: string, format: uuid }
-        status: { type: string, enum: [pending, delivering, succeeded, dead] }
+        endpoint_id:
+          type: string
+          format: uuid
+          description: The generation this delivery belongs to.
+        business_key: { type: string }
+        seq: { type: integer }
+        lineage_id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, delivering, succeeded, dead, skipped] }
         attempt_count: { type: integer }
         next_attempt_at: { type: string, format: date-time }
         last_status_code: { type: integer, nullable: true }
         last_error: { type: string, nullable: true }
+        skip_reason: { type: string, nullable: true }
+        skipped_by: { type: string, nullable: true }
+        skipped_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     Attempt:

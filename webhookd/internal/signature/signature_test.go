@@ -81,3 +81,46 @@ func TestVerifyRejects(t *testing.T) {
 		t.Errorf("future timestamp: got %v, want ErrTimestampOutsideWindow", err)
 	}
 }
+
+func TestVerifyWithRotation(t *testing.T) {
+	oldSecret := "whsec_old"
+	newSecret := "whsec_new"
+	body := []byte(`{"id":"evt_rot"}`)
+	now := time.Now()
+	expires := now.Add(10 * time.Minute)
+
+	// Signatures made with each secret.
+	oldHeader := SignHeader(oldSecret, now.Unix(), body)
+	newHeader := SignHeader(newSecret, now.Unix(), body)
+
+	// During the window: both secrets are accepted.
+	if err := VerifyWithRotation(newSecret, oldSecret, expires, newHeader, body, now, DefaultTolerance); err != nil {
+		t.Errorf("new secret during window: %v", err)
+	}
+	if err := VerifyWithRotation(newSecret, oldSecret, expires, oldHeader, body, now, DefaultTolerance); err != nil {
+		t.Errorf("old secret during window: %v", err)
+	}
+
+	// After the window: the old secret is rejected, the new one still works.
+	// (Sign fresh at the later time so the timestamp window stays valid.)
+	after := expires.Add(time.Second)
+	oldHeaderLate := SignHeader(oldSecret, after.Unix(), body)
+	newHeaderLate := SignHeader(newSecret, after.Unix(), body)
+	if err := VerifyWithRotation(newSecret, oldSecret, expires, oldHeaderLate, body, after, DefaultTolerance); !errors.Is(err, ErrSignatureMismatch) {
+		t.Errorf("old secret after window: got %v, want ErrSignatureMismatch", err)
+	}
+	if err := VerifyWithRotation(newSecret, oldSecret, expires, newHeaderLate, body, after, DefaultTolerance); err != nil {
+		t.Errorf("new secret after window: %v", err)
+	}
+
+	// No previous secret configured: old signature never accepted.
+	if err := VerifyWithRotation(newSecret, "", time.Time{}, oldHeader, body, now, DefaultTolerance); !errors.Is(err, ErrSignatureMismatch) {
+		t.Errorf("old secret with no rotation configured: got %v, want ErrSignatureMismatch", err)
+	}
+
+	// Timestamp-window violations are not rescued by the fallback.
+	staleOld := SignHeader(oldSecret, now.Add(-time.Hour).Unix(), body)
+	if err := VerifyWithRotation(newSecret, oldSecret, expires, staleOld, body, now, DefaultTolerance); !errors.Is(err, ErrTimestampOutsideWindow) {
+		t.Errorf("stale old timestamp: got %v, want ErrTimestampOutsideWindow", err)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -29,6 +30,15 @@ func main() {
 	if secret == "" {
 		log.Fatal("WEBHOOK_SECRET is required")
 	}
+	// Optional bounded rotation window: the previous secret is accepted only
+	// until PREVIOUS_SECRET_EXPIRES (unix seconds).
+	prevSecret := os.Getenv("PREVIOUS_SECRET")
+	var prevExpires time.Time
+	if v := os.Getenv("PREVIOUS_SECRET_EXPIRES"); v != "" {
+		if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+			prevExpires = time.Unix(ts, 0)
+		}
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9090"
@@ -41,9 +51,10 @@ func main() {
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
-		// 1. Verify signature AND timestamp window.
-		if err := signature.Verify(secret, r.Header.Get(signature.HeaderSignature), body,
-			time.Now(), signature.DefaultTolerance); err != nil {
+		// 1. Verify signature AND timestamp window (dual-secret only inside
+		//    the bounded rotation window).
+		if err := signature.VerifyWithRotation(secret, prevSecret, prevExpires,
+			r.Header.Get(signature.HeaderSignature), body, time.Now(), signature.DefaultTolerance); err != nil {
 			http.Error(w, "signature verification failed: "+err.Error(), http.StatusUnauthorized)
 			return
 		}

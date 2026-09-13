@@ -33,6 +33,7 @@ func NewServer(st *store.Store, guard *ssrf.Guard, tk *testkit.Receiver) *Server
 	v1.GET("/endpoints/:id", s.getEndpoint)
 	v1.PATCH("/endpoints/:id", s.updateEndpoint)
 	v1.DELETE("/endpoints/:id", s.deleteEndpoint)
+	v1.POST("/endpoints/:id/migrate", s.migrateEndpoint)
 	v1.POST("/endpoints/:id/rotate-secret", s.rotateSecret)
 
 	v1.POST("/events", s.publishEvent)
@@ -41,6 +42,7 @@ func NewServer(st *store.Store, guard *ssrf.Guard, tk *testkit.Receiver) *Server
 	v1.GET("/deliveries", s.listDeliveries)
 	v1.GET("/deliveries/:id", s.getDelivery)
 	v1.POST("/deliveries/:id/replay", s.replayDelivery)
+	v1.POST("/deliveries/:id/skip", s.skipDelivery)
 
 	if tk != nil {
 		tk.Mount(r)

@@ -86,6 +86,22 @@ func Verify(secret, header string, body []byte, now time.Time, tolerance time.Du
 	return ErrSignatureMismatch
 }
 
+// VerifyWithRotation verifies against the current secret, falling back to
+// the previous secret ONLY while the rotation window is still open
+// (now.Before(previousExpiresAt)). Once the window closes, old signatures
+// are rejected — rotated secrets are never kept valid indefinitely.
+func VerifyWithRotation(current, previous string, previousExpiresAt time.Time,
+	header string, body []byte, now time.Time, tolerance time.Duration) error {
+	err := Verify(current, header, body, now, tolerance)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrSignatureMismatch) && previous != "" && now.Before(previousExpiresAt) {
+		return Verify(previous, header, body, now, tolerance)
+	}
+	return err
+}
+
 // parseHeader parses "t=...,v1=...,v1=..." (extra keys are ignored so the
 // scheme can be extended with new versions).
 func parseHeader(h string) (int64, []string, error) {

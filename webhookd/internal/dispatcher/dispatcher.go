@@ -24,11 +24,15 @@ import (
 
 // Envelope is the JSON body delivered to endpoints. The event id in "id" is
 // the stable event identity; it is also sent as the Webhook-Id header.
+// "seq" is the event's position in the per-business-key delivery sequence:
+// receivers see gaps when a poison message was skipped by a human.
 type Envelope struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	CreatedAt time.Time       `json:"created_at"`
-	Data      json.RawMessage `json:"data"`
+	ID          string          `json:"id"`
+	Type        string          `json:"type"`
+	CreatedAt   time.Time       `json:"created_at"`
+	BusinessKey string          `json:"business_key"`
+	Seq         int64           `json:"seq"`
+	Data        json.RawMessage `json:"data"`
 }
 
 type Dispatcher struct {
@@ -118,10 +122,12 @@ func (d *Dispatcher) deliver(ctx context.Context, c store.ClaimedDelivery) error
 	attemptNo := c.Delivery.AttemptCount + 1
 
 	body, err := json.Marshal(Envelope{
-		ID:        c.Event.ID,
-		Type:      c.Event.EventType,
-		CreatedAt: c.Event.CreatedAt.UTC(),
-		Data:      c.Event.Payload,
+		ID:          c.Event.ID,
+		Type:        c.Event.EventType,
+		CreatedAt:   c.Event.CreatedAt.UTC(),
+		BusinessKey: c.Delivery.BusinessKey,
+		Seq:         c.Delivery.KeySeq,
+		Data:        c.Event.Payload,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
