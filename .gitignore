@@ -1,0 +1,21 @@
+# Local secrets and connection overrides
+.env
+.env.*
+!.env.example
+
+# Private key and certificate material
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local credential files and generated runtime data
+credentials.json
+secrets/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local build and coverage outputs
+coverage.out
+/bin/

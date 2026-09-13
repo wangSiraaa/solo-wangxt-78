@@ -1,0 +1,364 @@
+openapi: 3.0.3
+info:
+  title: webhookd — Webhook Delivery Service
+  version: 1.0.0
+  description: |
+    Reliable webhook delivery: events, subscription matching and pending
+    deliveries are written atomically in one PostgreSQL transaction
+    (transactional outbox). The database is the only source of truth.
+
+    ## Delivery semantics
+    * At-least-once delivery; the **event id never changes** across retries
+      and dead-letter replays, so receivers can deduplicate on `Webhook-Id`.
+    * 2xx = success. 429 = retry (honors `Retry-After`). 5xx and transport
+      errors (timeout, reset — i.e. possibly lost responses) = retry with
+      exponential backoff. Other 4xx and 3xx (redirects are never followed)
+      = dead-letter.
+    * Dead deliveries can be replayed; replay re-sends the **original event**
+      and never manufactures a new business fact.
+
+    ## Webhook request sent to endpoints
+    ```
+    POST <endpoint.url>
+    Content-Type: application/json
+    Webhook-Id: <event uuid>                       # stable event identity
+    Webhook-Timestamp: <unix seconds>
+    Webhook-Signature: t=<unix>,v1=<hex-hmac>      # HMAC-SHA256(secret, "<t>.<body>")
+
+    {"id": "...", "type": "order.created", "created_at": "...", "data": {...}}
+    ```
+    Receivers should verify the signature, reject timestamps outside a ±5
+    minute window, and deduplicate on the event id.
+
+    ## SSRF protections
+    Endpoint URLs are validated at registration (http/https only, no
+    userinfo, no loopback / RFC1918 / link-local / CGNAT / reserved ranges —
+    this blocks local admin ports and internal addresses). The delivery
+    dialer re-validates the resolved IP at connect time (DNS-rebinding
+    defense) and redirects are never followed. Local test receivers require
+    an explicit allowlist entry (`ALLOW_PRIVATE_HOSTS`).
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: endpoints
+  - name: events
+  - name: deliveries
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        '200': { description: OK }
+
+  /v1/endpoints:
+    post:
+      tags: [endpoints]
+      summary: Register an endpoint
+      description: |
+        The URL is validated against SSRF rules; internal/reserved addresses
+        are rejected with 400. The generated signing secret is returned
+        **only** in this response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, subscribed_events]
+              properties:
+                url: { type: string, example: https://customer.example.com/webhooks }
+                description: { type: string }
+                secret:
+                  type: string
+                  description: Optional client-supplied secret; generated when omitted.
+                subscribed_events:
+                  type: array
+                  items: { type: string }
+                  example: ["order.created", "order.paid"]
+                  description: Event types; "*" subscribes to everything.
+                retry_policy: { $ref: '#/components/schemas/RetryPolicy' }
+      responses:
+        '201':
+          description: Created; includes the signing secret (shown once)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointWithSecret' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    get:
+      tags: [endpoints]
+      summary: List endpoints (secrets redacted)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoints:
+                    type: array
+                    items: { $ref: '#/components/schemas/Endpoint' }
+
+  /v1/endpoints/{id}:
+    get:
+      tags: [endpoints]
+      summary: Get one endpoint
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Endpoint' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [endpoints]
+      summary: Update URL (re-validated), subscriptions, status or retry policy
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string }
+                description: { type: string }
+                subscribed_events: { type: array, items: { type: string } }
+                status: { type: string, enum: [active, disabled] }
+                retry_policy: { $ref: '#/components/schemas/RetryPolicy' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Endpoint' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [endpoints]
+      summary: Disable an endpoint (soft delete)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Disabled }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/endpoints/{id}/rotate-secret:
+    post:
+      tags: [endpoints]
+      summary: Rotate the signing secret (new secret returned once)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointWithSecret' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/events:
+    post:
+      tags: [events]
+      summary: Publish an event (transactional outbox)
+      description: |
+        Inserts the event, matches active subscriptions and creates pending
+        deliveries in **one transaction**. Re-publishing with the same
+        `Idempotency-Key` returns the original event (`deduplicated: true`,
+        HTTP 200) without creating new deliveries.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+          description: Producer-side idempotency key (unique per logical event).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, data]
+              properties:
+                type: { type: string, example: order.created }
+                data:
+                  type: object
+                  example: { business_key: order-42, amount: 100 }
+      responses:
+        '201': { $ref: '#/components/responses/PublishResult' }
+        '200': { $ref: '#/components/responses/PublishResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/events/{id}:
+    get:
+      tags: [events]
+      summary: Get an event with its deliveries
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event: { $ref: '#/components/schemas/Event' }
+                  deliveries:
+                    type: array
+                    items: { $ref: '#/components/schemas/Delivery' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/deliveries:
+    get:
+      tags: [deliveries]
+      summary: List deliveries
+      parameters:
+        - { name: event_id, in: query, schema: { type: string } }
+        - { name: endpoint_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, delivering, succeeded, dead] } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items: { $ref: '#/components/schemas/Delivery' }
+
+  /v1/deliveries/{id}:
+    get:
+      tags: [deliveries]
+      summary: Get a delivery with its attempt log
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivery: { $ref: '#/components/schemas/Delivery' }
+                  attempts:
+                    type: array
+                    items: { $ref: '#/components/schemas/Attempt' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/deliveries/{id}/replay:
+    post:
+      tags: [deliveries]
+      summary: Replay a dead-letter delivery
+      description: |
+        Re-queues a **dead** delivery. The original event row is reused
+        as-is — replay never creates a new event / business fact.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Re-queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivery: { $ref: '#/components/schemas/Delivery' }
+                  note: { type: string }
+        '409':
+          description: Delivery is not in dead state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Invalid input (validation or SSRF rejection)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PublishResult:
+      description: Publish result (201 new, 200 idempotent replay)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              event: { $ref: '#/components/schemas/Event' }
+              deliveries_created: { type: integer }
+              deduplicated: { type: boolean }
+
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: string } }
+    RetryPolicy:
+      type: object
+      properties:
+        max_attempts: { type: integer, minimum: 1, maximum: 25, default: 8 }
+        backoff_base_ms: { type: integer, minimum: 50, default: 1000 }
+        backoff_max_ms: { type: integer, minimum: 100, default: 300000 }
+        http_timeout_ms: { type: integer, minimum: 500, maximum: 60000, default: 10000 }
+    Endpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string }
+        description: { type: string }
+        subscribed_events: { type: array, items: { type: string } }
+        status: { type: string, enum: [active, disabled] }
+        retry_policy: { $ref: '#/components/schemas/RetryPolicy' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    EndpointWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/Endpoint'
+        - type: object
+          properties:
+            secret: { type: string, example: whsec_9f2c... }
+    Event:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string }
+        data: { type: object }
+        created_at: { type: string, format: date-time }
+    Delivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        event_id: { type: string, format: uuid }
+        endpoint_id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, delivering, succeeded, dead] }
+        attempt_count: { type: integer }
+        next_attempt_at: { type: string, format: date-time }
+        last_status_code: { type: integer, nullable: true }
+        last_error: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Attempt:
+      type: object
+      properties:
+        id: { type: integer }
+        delivery_id: { type: string, format: uuid }
+        attempt_no: { type: integer }
+        status_code:
+          type: integer
+          nullable: true
+          description: NULL when the request got no response (timeout/reset).
+        error: { type: string }
+        duration_ms: { type: integer }
+        created_at: { type: string, format: date-time }

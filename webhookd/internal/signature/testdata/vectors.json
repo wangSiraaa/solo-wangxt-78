@@ -1,0 +1,29 @@
+{
+  "scheme": "Webhook-Signature: t=\u003cunix\u003e,v1=\u003chex-hmac-sha256(secret, '\u003ct\u003e.\u003cbody\u003e')\u003e",
+  "vectors": [
+    {
+      "name": "basic-order-event",
+      "secret": "whsec_0000000000000000000000000000000000000000000000000000000000000001",
+      "timestamp": 1694515200,
+      "body": "{\"id\":\"evt_0190a8b0-7a2b-7c3d-8e4f-000000000001\",\"type\":\"order.created\",\"created_at\":\"2023-09-12T10:00:00Z\",\"data\":{\"business_key\":\"order-42\",\"amount\":100}}",
+      "signature": "103af60df715403961c5d201c84a4b1fe8b5276e142927f51bee8eba656d9967",
+      "header": "t=1694515200,v1=103af60df715403961c5d201c84a4b1fe8b5276e142927f51bee8eba656d9967"
+    },
+    {
+      "name": "empty-json-object",
+      "secret": "whsec_abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "timestamp": 1700000000,
+      "body": "{}",
+      "signature": "c2c77d6c3b8856b60f3bc5442a54a5807326b3c24d0e51e8c7721ee7cf98cc52",
+      "header": "t=1700000000,v1=c2c77d6c3b8856b60f3bc5442a54a5807326b3c24d0e51e8c7721ee7cf98cc52"
+    },
+    {
+      "name": "unicode-payload",
+      "secret": "whsec_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "timestamp": 1757664000,
+      "body": "{\"id\":\"evt_unicode\",\"type\":\"user.updated\",\"data\":{\"name\":\"张三\",\"emoji\":\"🚀\"}}",
+      "signature": "4e7335efc5a5ddafb03f71aa43595a787d6793be09a551ab638ed46f0ca09b85",
+      "header": "t=1757664000,v1=4e7335efc5a5ddafb03f71aa43595a787d6793be09a551ab638ed46f0ca09b85"
+    }
+  ]
+}
