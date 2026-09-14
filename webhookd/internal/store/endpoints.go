@@ -11,6 +11,11 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+// ErrCannotReactivate is returned when trying to set a superseded generation
+// back to active: a lineage must always have exactly one active generation
+// (the newest). Old generations are immutable audit history.
+var ErrCannotReactivate = errors.New("superseded generations cannot be reactivated")
+
 const endpointCols = `id, lineage_id, generation, url, description, secret, previous_secret,
 	previous_secret_expires_at, subscribed_events, status,
 	max_attempts, backoff_base_ms, backoff_max_ms, http_timeout_ms, created_at, updated_at`
@@ -52,7 +57,7 @@ func (s *Store) ListEndpoints(ctx context.Context) ([]Endpoint, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Endpoint
+	out := []Endpoint{}
 	for rows.Next() {
 		var e Endpoint
 		if err := rows.Scan(&e.ID, &e.LineageID, &e.Generation, &e.URL, &e.Description, &e.Secret,
@@ -80,6 +85,22 @@ type EndpointPatch struct {
 }
 
 func (s *Store) UpdateEndpoint(ctx context.Context, id string, p EndpointPatch) (*Endpoint, error) {
+	// A superseded generation must never come back to life: reactivating it
+	// would give the lineage two active generations and the old domain
+	// would start matching new events again.
+	if p.Status != nil && *p.Status == "active" {
+		var cur string
+		err := s.pool.QueryRow(ctx, `SELECT status FROM endpoints WHERE id = $1`, id).Scan(&cur)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		if cur == "superseded" {
+			return nil, ErrCannotReactivate
+		}
+	}
 	sets := []string{}
 	args := []any{id}
 	add := func(clause string, v any) {
@@ -165,6 +186,13 @@ func (s *Store) MigrateEndpoint(ctx context.Context, oldID, newURL string) (*End
 		if old.Status != "active" {
 			return fmt.Errorf("endpoint %s is %s, only active endpoints can be migrated", oldID, old.Status)
 		}
+		// Supersede BEFORE inserting the new generation: the partial unique
+		// index endpoints_one_active_per_lineage allows only one active row
+		// per lineage at any time.
+		if _, err := tx.Exec(ctx,
+			`UPDATE endpoints SET status = 'superseded', updated_at = now() WHERE id = $1`, oldID); err != nil {
+			return err
+		}
 		newEp, err := scanEndpoint(tx.QueryRow(ctx,
 			`INSERT INTO endpoints (lineage_id, generation, url, description, secret,
 			        subscribed_events, max_attempts, backoff_base_ms, backoff_max_ms, http_timeout_ms)
@@ -173,10 +201,6 @@ func (s *Store) MigrateEndpoint(ctx context.Context, oldID, newURL string) (*End
 			old.LineageID, old.Generation+1, newURL, old.Description, old.Secret,
 			old.SubscribedEvents, old.MaxAttempts, old.BackoffBaseMs, old.BackoffMaxMs, old.HTTPTimeoutMs))
 		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE endpoints SET status = 'superseded', updated_at = now() WHERE id = $1`, oldID); err != nil {
 			return err
 		}
 		// Re-point unsent deliveries to the new generation.

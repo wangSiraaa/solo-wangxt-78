@@ -36,6 +36,16 @@ const eventCols = `id, idempotency_key, event_type, business_key, key_seq, paylo
 func (s *Store) CreateEvent(ctx context.Context, p CreateEventParams) (*CreateEventResult, error) {
 	res := &CreateEventResult{}
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		// Serialize concurrent publishers of the SAME idempotency key
+		// (database-scoped lock, works across service instances). The
+		// duplicate check below then runs before any sequence number is
+		// allocated, so concurrent duplicates never burn a key_seq and
+		// never create fake downstream gaps.
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext($1))`, p.IdempotencyKey); err != nil {
+			return err
+		}
+
 		// Fast path: idempotent replay returns the original fact without
 		// burning a sequence number (gaps should mean skips, not replays).
 		err := tx.QueryRow(ctx,

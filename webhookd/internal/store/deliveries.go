@@ -30,7 +30,7 @@ func scanDelivery(row pgx.Row) (*Delivery, error) {
 
 func scanDeliveries(rows pgx.Rows) ([]Delivery, error) {
 	defer rows.Close()
-	var out []Delivery
+	out := []Delivery{}
 	for rows.Next() {
 		var d Delivery
 		if err := rows.Scan(&d.ID, &d.EventID, &d.EndpointID, &d.BusinessKey, &d.KeySeq, &d.LineageID,

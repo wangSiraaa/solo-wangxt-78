@@ -165,8 +165,11 @@ func (s *Server) updateEndpoint(c *gin.Context) {
 	ep, err := s.store.UpdateEndpoint(c.Request.Context(), c.Param("id"), patch)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, store.ErrNotFound) {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
 			status = http.StatusNotFound
+		case errors.Is(err, store.ErrCannotReactivate):
+			status = http.StatusConflict
 		}
 		abort(c, status, err)
 		return
